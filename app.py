@@ -149,6 +149,31 @@ class Repository:
                 detail_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS merges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                master_case_id INTEGER NOT NULL REFERENCES cases(id),
+                source_case_id INTEGER NOT NULL REFERENCES cases(id),
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                irreversible_reason TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                undone_at TEXT,
+                undone_by TEXT
+            );
+            CREATE TABLE IF NOT EXISTS merge_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merge_id INTEGER NOT NULL REFERENCES merges(id),
+                source_case_id INTEGER NOT NULL REFERENCES cases(id),
+                kind TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                original_revision INTEGER,
+                UNIQUE(merge_id, kind, record_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_merge_items_merge ON merge_items(merge_id);
+            CREATE INDEX IF NOT EXISTS idx_merges_master ON merges(master_case_id);
+            CREATE INDEX IF NOT EXISTS idx_merges_source ON merges(source_case_id);
+            CREATE INDEX IF NOT EXISTS idx_merges_status ON merges(status);
             """
         )
 
@@ -246,7 +271,7 @@ class PharmacovigilanceService:
         }
 
     def list_cases(self, role: str, region: str, query: dict[str, list[str]]) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM cases WHERE status!='merged'"
+        sql = "SELECT * FROM cases WHERE status NOT IN ('merged','merging')"
         args: list[Any] = []
         if role not in {"medical_reviewer", "global_admin"}:
             sql += " AND region=?"
@@ -269,8 +294,8 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region) or role in {"medical_reviewer"}:
                 raise ApiError(403, "followup_forbidden", "当前角色不能提交随访")
-            if case["status"] == "merged":
-                raise ApiError(409, "case_merged", "已合并案例不能再更新")
+            if case["status"] in ("merged", "merging"):
+                raise ApiError(409, "case_merged", "已合并或正在合并的案例不能更新")
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
@@ -305,8 +330,8 @@ class PharmacovigilanceService:
         due = report_deadline(received, serious, fatal)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
-            if case["status"] == "merged":
-                raise ApiError(409, "case_merged", "已合并案例不能审核")
+            if case["status"] in ("merged", "merging"):
+                raise ApiError(409, "case_merged", "已合并或正在合并的案例不能审核")
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
             revision = expected + 1
@@ -357,24 +382,203 @@ class PharmacovigilanceService:
             Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
 
+    @staticmethod
+    def _recompute_revision(conn: sqlite3.Connection, case_id: int) -> None:
+        """Recompute a case's revision from its followups and reviews.
+
+        Used after a merge/undo so the revision reflects the true maximum
+        assigned revision, preventing optimistic-lock collisions.
+        """
+        row = conn.execute(
+            """SELECT
+                (SELECT COALESCE(MAX(revision),0) FROM followups WHERE case_id=?) AS max_fu,
+                (SELECT COALESCE(MAX(case_revision),0) FROM medical_reviews WHERE case_id=?) AS max_review""",
+            (case_id, case_id),
+        ).fetchone()
+        # A review recorded at case_revision N bumps the case to N+1.
+        new_rev = max(1, row["max_fu"], row["max_review"] + 1)
+        conn.execute("UPDATE cases SET revision=?,updated_at=? WHERE id=?", (new_rev, iso(), case_id))
+
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
             raise ApiError(403, "merge_forbidden", "只有全局管理员可以合并案例")
         target_id = body.get("target_case_id")
         if not isinstance(target_id, int) or source_id == target_id:
             raise ApiError(400, "invalid_target", "target_case_id 必须指向不同案例")
+        now = iso()
+
+        # Phase 1: acquire a visible, resumable in-progress lock on the source case.
+        with self.repo.tx() as conn:
+            source = self._case(conn, source_id)
+            if source["status"] == "merged":
+                merge_row = conn.execute(
+                    "SELECT * FROM merges WHERE source_case_id=? ORDER BY id DESC LIMIT 1",
+                    (source_id,),
+                ).fetchone()
+                return {"case": dict(source), "idempotent": True, "merge": dict(merge_row) if merge_row else None}
+            if source["status"] == "merging":
+                merge_row = conn.execute(
+                    "SELECT * FROM merges WHERE source_case_id=? AND status='in_progress' ORDER BY id DESC LIMIT 1",
+                    (source_id,),
+                ).fetchone()
+                if not merge_row:
+                    raise ApiError(409, "merge_in_progress", "案例处于合并中，但找不到进行中的合并记录")
+                if target_id != merge_row["master_case_id"]:
+                    raise ApiError(409, "merge_conflict", "合并正在进行中，主案例不能更改")
+                merge_id = merge_row["id"]
+            else:
+                target = self._case(conn, target_id)
+                if target["status"] != "open":
+                    raise ApiError(409, "merge_conflict", "主案例必须是开放状态")
+                if source["product"].casefold() != target["product"].casefold():
+                    raise ApiError(409, "merge_conflict", "产品与来源案例不一致")
+                cur = conn.execute(
+                    "INSERT INTO merges(master_case_id,source_case_id,status,created_by,created_at) VALUES(?,?,?,?,?)",
+                    (target_id, source_id, "in_progress", actor, now),
+                )
+                merge_id = cur.lastrowid
+                conn.execute("UPDATE cases SET status='merging',updated_at=? WHERE id=?", (now, source_id))
+                Repository.audit(conn, source_id, actor, role, "merge_started", {"merge_id": merge_id, "target_case_id": target_id})
+                Repository.audit(conn, target_id, actor, role, "merge_started", {"merge_id": merge_id, "source_case_id": source_id})
+
+        # Phase 2: move intakes and followups onto the master atomically.
+        # If this fails, the source stays 'merging' and a retry resumes here
+        # without leaving half-moved data (the transaction rolls back).
         with self.repo.tx() as conn:
             source = self._case(conn, source_id)
             target = self._case(conn, target_id)
-            if source["status"] == "merged":
-                return {"case": dict(source), "idempotent": True}
-            if target["status"] == "merged" or source["product"].casefold() != target["product"].casefold():
-                raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
-            conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
-            conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
-            Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
-            Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
-            return {"case": dict(self._case(conn, source_id)), "idempotent": False}
+            merge_row = conn.execute("SELECT * FROM merges WHERE id=?", (merge_id,)).fetchone()
+            if not merge_row or merge_row["status"] != "in_progress":
+                raise ApiError(409, "merge_not_in_progress", "合并记录不在进行中，无法继续")
+            if source["status"] != "merging":
+                raise ApiError(409, "merge_conflict", "来源案例已不在合并状态")
+            if target["status"] != "open":
+                raise ApiError(409, "merge_conflict", "主案例已被合并或关闭，无法继续")
+
+            # Move intakes (idempotent: skip anything already recorded).
+            intakes = conn.execute("SELECT * FROM intakes WHERE case_id=? ORDER BY id", (source_id,)).fetchall()
+            for intake in intakes:
+                done = conn.execute(
+                    "SELECT 1 FROM merge_items WHERE merge_id=? AND kind='intake' AND record_id=?",
+                    (merge_id, intake["id"]),
+                ).fetchone()
+                if done:
+                    continue
+                conn.execute(
+                    "INSERT INTO merge_items(merge_id,source_case_id,kind,record_id) VALUES(?,?,?,?)",
+                    (merge_id, source_id, "intake", intake["id"]),
+                )
+                conn.execute("UPDATE intakes SET case_id=? WHERE id=?", (target_id, intake["id"]))
+
+            # Move followups, renumbering onto the master's revision sequence.
+            followups = conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision,id", (source_id,)).fetchall()
+            master_revision = target["revision"]
+            next_revision = master_revision + 1
+            moved = 0
+            for fu in followups:
+                done = conn.execute(
+                    "SELECT 1 FROM merge_items WHERE merge_id=? AND kind='followup' AND record_id=?",
+                    (merge_id, fu["id"]),
+                ).fetchone()
+                if done:
+                    continue
+                conn.execute(
+                    "INSERT INTO merge_items(merge_id,source_case_id,kind,record_id,original_revision) VALUES(?,?,?,?,?)",
+                    (merge_id, source_id, "followup", fu["id"], fu["revision"]),
+                )
+                conn.execute("UPDATE followups SET case_id=?,revision=? WHERE id=?", (target_id, next_revision, fu["id"]))
+                next_revision += 1
+                moved += 1
+            if moved:
+                conn.execute("UPDATE cases SET revision=?,updated_at=? WHERE id=?", (master_revision + moved, now, target_id))
+
+            # Submitted national reports cannot be split apart: mark irreversible.
+            submitted = conn.execute(
+                "SELECT 1 FROM reports WHERE case_id=? AND status='submitted' LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if submitted:
+                final_status = "irreversible"
+                reason = "来源案例存在已提交的国家报告，监管报送记录不可拆分，本次合并不可撤销"
+            else:
+                final_status = "completed"
+                reason = None
+            conn.execute(
+                "UPDATE merges SET status=?,irreversible_reason=?,completed_at=? WHERE id=?",
+                (final_status, reason, now, merge_id),
+            )
+            conn.execute(
+                "UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?",
+                (target_id, now, source_id),
+            )
+            Repository.audit(conn, target_id, actor, role, "case_merged_in",
+                             {"merge_id": merge_id, "source_case_id": source_id, "irreversible": reason is not None})
+            Repository.audit(conn, source_id, actor, role, "case_merged_into",
+                             {"merge_id": merge_id, "target_case_id": target_id, "irreversible": reason is not None})
+            return {
+                "case": dict(self._case(conn, source_id)),
+                "idempotent": False,
+                "merge": dict(conn.execute("SELECT * FROM merges WHERE id=?", (merge_id,)).fetchone()),
+            }
+
+    def undo_merge(self, merge_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role != "global_admin":
+            raise ApiError(403, "merge_forbidden", "只有全局管理员可以撤销合并")
+        now = iso()
+        with self.repo.tx() as conn:
+            merge_row = conn.execute("SELECT * FROM merges WHERE id=?", (merge_id,)).fetchone()
+            if not merge_row:
+                raise ApiError(404, "merge_not_found", "合并记录不存在")
+            if merge_row["status"] == "undone":
+                return {"merge": dict(merge_row), "idempotent": True}
+            if merge_row["status"] == "irreversible":
+                raise ApiError(409, "merge_irreversible", f"该合并不可撤销：{merge_row['irreversible_reason']}")
+            if merge_row["status"] == "in_progress":
+                raise ApiError(409, "merge_in_progress", "合并仍在进行中，无法撤销")
+            master_id = merge_row["master_case_id"]
+            source_id = merge_row["source_case_id"]
+
+            # Restore every moved record to its original case.
+            items = conn.execute("SELECT * FROM merge_items WHERE merge_id=? ORDER BY id", (merge_id,)).fetchall()
+            for item in items:
+                if item["kind"] == "intake":
+                    conn.execute("UPDATE intakes SET case_id=? WHERE id=?", (item["source_case_id"], item["record_id"]))
+                elif item["kind"] == "followup":
+                    conn.execute(
+                        "UPDATE followups SET case_id=?,revision=? WHERE id=?",
+                        (item["source_case_id"], item["original_revision"], item["record_id"]),
+                    )
+
+            # Reopen the source case and recompute both revisions.
+            conn.execute("UPDATE cases SET status='open',merged_into=NULL WHERE id=?", (source_id,))
+            self._recompute_revision(conn, source_id)
+            self._recompute_revision(conn, master_id)
+            conn.execute(
+                "UPDATE merges SET status='undone',undone_at=?,undone_by=? WHERE id=?",
+                (now, actor, merge_id),
+            )
+            Repository.audit(conn, master_id, actor, role, "merge_undone", {"merge_id": merge_id, "source_case_id": source_id})
+            Repository.audit(conn, source_id, actor, role, "merge_undone", {"merge_id": merge_id, "master_case_id": master_id})
+            return {
+                "merge": dict(conn.execute("SELECT * FROM merges WHERE id=?", (merge_id,)).fetchone()),
+                "idempotent": False,
+            }
+
+    def list_merges(self, role: str) -> list[dict[str, Any]]:
+        if role != "global_admin":
+            raise ApiError(403, "merge_forbidden", "只有全局管理员可以查看合并记录")
+        return [dict(r) for r in self.repo.conn.execute("SELECT * FROM merges ORDER BY id DESC")]
+
+    def get_merge(self, merge_id: int, role: str) -> dict[str, Any]:
+        if role != "global_admin":
+            raise ApiError(403, "merge_forbidden", "只有全局管理员可以查看合并记录")
+        row = self.repo.conn.execute("SELECT * FROM merges WHERE id=?", (merge_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "merge_not_found", "合并记录不存在")
+        result = dict(row)
+        result["items"] = [dict(r) for r in self.repo.conn.execute(
+            "SELECT * FROM merge_items WHERE merge_id=? ORDER BY id", (merge_id,))]
+        return result
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
         sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
@@ -435,11 +639,15 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.state(role, region)
         if path == "/api/cases":
             return 200, {"cases": self.service.list_cases(role, region, query)}
+        if path == "/api/merges":
+            return 200, {"merges": self.service.list_merges(role)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 3 and parts[:2] == ["api", "merges"] and parts[2].isdigit():
+            return 200, self.service.get_merge(int(parts[2]), role)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -461,6 +669,8 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.merge_cases(case_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "merges"] and parts[2].isdigit() and parts[3] == "undo":
+            return 200, self.service.undo_merge(int(parts[2]), actor, role)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:
